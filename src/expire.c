@@ -195,6 +195,75 @@ static int activeExpireEffort(void) {
     return server.active_expire_effort - 1;
 }
 
+static void activeExpireGetJobConfig(enum activeExpiryType jobType, serverDb *db, kvstore **kvs,
+                                     kvstoreScanFunction *scan_cb, int *time_check_mask) {
+    switch (jobType) {
+    case KEYS:
+        *kvs = db ? db->expires : NULL;
+        *scan_cb = expireScanCallback;
+        /* For regular keys we can check the time condition every 16 loop iterations. */
+        *time_check_mask = 0xf;
+        break;
+    case FIELDS:
+        *kvs = db ? db->keys_with_volatile_items : NULL;
+        *scan_cb = fieldExpireScanCallback;
+        /* For field-level keys we check the time condition every loop iteration.
+         * This is required since we might perform much more operation per single key with many fields.
+         * Limiting the number of fields we scan in each field makes the overall process less efficient.
+         * So we just perform more clock checks after each iteration. */
+        *time_check_mask = 0x0;
+        break;
+    default:
+        serverPanic("Unknown active expiry job type %d.", jobType);
+    }
+}
+
+static int activeExpireShouldRepeatCycle(int db_done, const expireScanData *data, unsigned long acceptable_stale) {
+    if (db_done) return 0;
+    if (data->sampled == 0) return 1;
+    return (data->expired * 100 / data->sampled) > acceptable_stale;
+}
+
+static void activeExpireUpdateAvgTtl(serverDb *db, enum activeExpiryType jobType, expireScanData *data,
+                                     int *update_avg_ttl_times) {
+    if (jobType != KEYS || data->ttl_samples == 0) return;
+
+    /* Average TTL is calculated only for keys, as there's currently
+     * no reliable way to compute it for fields. */
+    long long avg_ttl = data->ttl_sum / data->ttl_samples;
+
+    /* Do a simple running average with a few samples.
+     * We just use the current estimate with a weight of 2%
+     * and the previous estimate with a weight of 98%. */
+    if (db->expiry[jobType].avg_ttl == 0) {
+        db->expiry[jobType].avg_ttl = avg_ttl;
+    } else {
+        /* The origin code is as follow.
+         * for (int i = 0; i < update_avg_ttl_times; i++) {
+         *   db->avg_ttl = (db->avg_ttl/50)*49 + (avg_ttl/50);
+         * }
+         * We can convert the loop into a sum of a geometric progression.
+         * db->avg_ttl = db->avg_ttl * pow(0.98, update_avg_ttl_times) +
+         *                  avg_ttl / 50 * (pow(0.98, update_avg_ttl_times - 1) + ... + 1)
+         *             = db->avg_ttl * pow(0.98, update_avg_ttl_times) +
+         *                  avg_ttl * (1 - pow(0.98, update_avg_ttl_times))
+         *             = avg_ttl +  (db->avg_ttl - avg_ttl) * pow(0.98, update_avg_ttl_times)
+         * Notice that update_avg_ttl_times is between 1 and 16, we use a constant table
+         * to accelerate the calculation of pow(0.98, update_avg_ttl_times).*/
+        db->expiry[jobType].avg_ttl =
+            avg_ttl + (db->expiry[jobType].avg_ttl - avg_ttl) * avg_ttl_factor[*update_avg_ttl_times - 1];
+    }
+
+    *update_avg_ttl_times = 0;
+    data->ttl_sum = 0;
+    data->ttl_samples = 0;
+}
+
+static void activeExpireUpdateStalePercentage(double *expired_stale_perc, long total_sampled, long total_expired) {
+    double current_perc = total_sampled ? (double)total_expired / total_sampled : 0;
+    *expired_stale_perc = (current_perc * 0.05) + (*expired_stale_perc * 0.95);
+}
+
 static long long activeExpireCycleJob(enum activeExpiryType jobType, int cycleType, long long timelimit_us) {
     if (timelimit_us <= 0) return 0;
 
@@ -271,26 +340,7 @@ static long long activeExpireCycleJob(enum activeExpiryType jobType, int cycleTy
         kvstoreScanFunction scan_cb;
 
         kvstore *kvs = NULL;
-        if (db) {
-            switch (jobType) {
-            case KEYS:
-                kvs = db->expires;
-                scan_cb = expireScanCallback;
-                time_check_mask = 0xf; /* For regular keys we can check the time condition every 16 loop iterations */
-                break;
-            case FIELDS:
-                kvs = db->keys_with_volatile_items;
-                scan_cb = fieldExpireScanCallback;
-                /* For field-level keys we check the time condition every loop iteration.
-                 * This is required since we might perform much more operation per single key with many fields.
-                 * Limiting the number of fields we scan in each field makes the overall process less efficient.
-                 * So we just perform more clock checks after each iteration. */
-                time_check_mask = 0x0;
-                break;
-            default:
-                serverPanic("Unknown active expiry job type %d.", jobType);
-            }
-        }
+        activeExpireGetJobConfig(jobType, db, &kvs, &scan_cb, &time_check_mask);
 
         if (db && kvstoreSize(kvs)) dbs_performed++;
 
@@ -355,9 +405,7 @@ static long long activeExpireCycleJob(enum activeExpiryType jobType, int cycleTy
             /* We don't repeat the cycle for the current database if the db is done
              * for scanning or an acceptable number of stale keys (logically expired
              * but yet not reclaimed). */
-            repeat = db_done
-                         ? 0
-                         : (data.sampled == 0 || (data.expired * 100 / data.sampled) > config_cycle_acceptable_stale);
+            repeat = activeExpireShouldRepeatCycle(db_done, &data, config_cycle_acceptable_stale);
 
             /* We can't block forever here even if there are many keys to
              * expire. So after a given amount of microseconds return to the
@@ -366,36 +414,7 @@ static long long activeExpireCycleJob(enum activeExpiryType jobType, int cycleTy
                 !repeat) { /* Update the average TTL stats every 16 iterations or about to exit. */
                 /* Update the average TTL stats for this database,
                  * because this may reach the time limit. */
-                if (data.ttl_samples && jobType == KEYS) {
-                    /* Average TTL is calculated only for keys, as there's currently
-                     * no reliable way to compute it for fields. */
-
-                    long long avg_ttl = data.ttl_sum / data.ttl_samples;
-
-                    /* Do a simple running average with a few samples.
-                     * We just use the current estimate with a weight of 2%
-                     * and the previous estimate with a weight of 98%. */
-                    if (db->expiry[jobType].avg_ttl == 0) {
-                        db->expiry[jobType].avg_ttl = avg_ttl;
-                    } else {
-                        /* The origin code is as follow.
-                         * for (int i = 0; i < update_avg_ttl_times; i++) {
-                         *   db->avg_ttl = (db->avg_ttl/50)*49 + (avg_ttl/50);
-                         * }
-                         * We can convert the loop into a sum of a geometric progression.
-                         * db->avg_ttl = db->avg_ttl * pow(0.98, update_avg_ttl_times) +
-                         *                  avg_ttl / 50 * (pow(0.98, update_avg_ttl_times - 1) + ... + 1)
-                         *             = db->avg_ttl * pow(0.98, update_avg_ttl_times) +
-                         *                  avg_ttl * (1 - pow(0.98, update_avg_ttl_times))
-                         *             = avg_ttl +  (db->avg_ttl - avg_ttl) * pow(0.98, update_avg_ttl_times)
-                         * Notice that update_avg_ttl_times is between 1 and 16, we use a constant table
-                         * to accelerate the calculation of pow(0.98, update_avg_ttl_times).*/
-                        db->expiry[jobType].avg_ttl = avg_ttl + (db->expiry[jobType].avg_ttl - avg_ttl) * avg_ttl_factor[update_avg_ttl_times - 1];
-                    }
-                    update_avg_ttl_times = 0;
-                    data.ttl_sum = 0;
-                    data.ttl_samples = 0;
-                }
+                activeExpireUpdateAvgTtl(db, jobType, &data, &update_avg_ttl_times);
             }
             /* check time limit for every FIELDS job iteration or every 16 iterations for KEYS. */
             if ((iteration & time_check_mask) == 0) {
@@ -417,12 +436,7 @@ static long long activeExpireCycleJob(enum activeExpiryType jobType, int cycleTy
 
     /* Update our estimate of keys existing but yet to be expired.
      * Running average with this sample accounting for 5%. */
-    double current_perc;
-    if (total_sampled) {
-        current_perc = (double)total_expired / total_sampled;
-    } else
-        current_perc = 0;
-    *expired_stale_perc[jobType] = (current_perc * 0.05) + (*expired_stale_perc[jobType] * 0.95);
+    activeExpireUpdateStalePercentage(expired_stale_perc[jobType], total_sampled, total_expired);
 
     return elapsed;
 }
